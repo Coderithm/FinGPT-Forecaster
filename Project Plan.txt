@@ -1,0 +1,174 @@
+PROJECT PLAN: FinGPT Forecaster
+
+1. PROJECT OVERVIEW
+-------------------
+FinGPT Forecaster is an advanced financial analysis tool that leverages Large Language Models (LLMs) 
+to predict stock price movements. By combining historical stock data, real-time market news, and 
+company financial profiles, it acts as an intelligent robo-advisor, providing analysis, prediction, 
+and summary for specific stock tickers.
+
+2. FILE SIGNIFICANCE & RELATIONSHIPS
+------------------------------------
+The codebase is structured to separate concerns between application logic, setup, and diagnostics.
+
+* **fingpt/FinGPT_Forecaster/app.py**
+   - **Significance**: This is the core "Brain" of the project. It contains the main application 
+   logic.
+   - **Functionality**:
+     - Initializes the AI models (Cloud Groq client or Local Llama-2 model).
+     - Defines data fetching functions (`get_stock_data`, `get_news`, `get_current_basics`).
+     - Constructs the prompt for the LLM.
+     - Builds and launches the Gradio user interface.
+   - **Relationship**: Dependent on `yfinance`, `finnhub`, and `groq`/`transformers` libraries. 
+   It is executed by `run_local.py`.
+
+* **run_local.py**
+   - **Significance**: The easy-to-use "Entry Point" for the user.
+   - **Functionality**:
+     - Checks for necessary API keys (HF_TOKEN, FINNHUB_API_KEY, GROQ_API_KEY).
+     - Prompts the user to input keys if missing.
+     - Sets environment variables for the session.
+     - Launches `app.py` in a subprocess.
+   - **Relationship**: Acts as a wrapper around `app.py` to ensure the environment is correctly 
+   set up before running.
+
+* **diagnose_env.py**
+   - **Significance**: Diagnostic tool for troubleshooting.
+   - **Functionality**: Checks the system for:
+     - Python version.
+     - Status of API keys (detects if missing).
+     - Availability of critical libraries (Torch, YFinance, Finnhub, Transformers).
+     - CUDA/GPU availability for local inference.
+   - **Relationship**: Standalone utility to check prerequisites before running `run_local.py`.
+
+* **debug_data.py**
+   - **Significance**: Data verification tool.
+   - **Functionality**: Independently fetches data for a hardcoded symbol (e.g., AAPL) without 
+   running the AI model. It isolates issues to see if errors are coming from the data providers 
+   (YFinance/Finnhub) or the Application logic.
+   - **Relationship**: Standalone utility for "Unit Testing" the data layer.
+
+* **requirements.txt**
+   - **Significance**: Dependency management.
+   - **Functionality**: Lists the Python libraries required to run the project.
+
+* **.env** (Hidden file)
+   - **Significance**: Security and Configuration.
+   - **Functionality**: Stores sensitive API keys so they don't need to be entered every time.
+   - **Relationship**: Loaded by `app.py` and `run_local.py`.
+
+3. SUBFOLDER SIGNIFICANCE & REASONS
+-----------------------------------
+The `FinGPT` repository is a monorepo containing various modules for different financial AI tasks.
+Inside the `finGPT/fingpt` directory, we find specialized components:
+
+* **fingpt/FinGPT_Forecaster** (THE FOCUS OF THIS PROJECT)
+   - **Significance**: The specific application module we are running.
+   - **Reason/Need**: Segregates the forecasting logic (Robo-Advisor) from other FinGPT experiments like sentiment analysis or benchmarks. This containment allows `app.py` to be self-contained.
+
+* **fingpt/FinGPT_RAG** & **fingpt/FinGPT_MultiAgentsRAG**
+   - **Significance**: Modules for Retrieval Augmented Generation (RAG).
+   - **Reason/Need**: RAG is needed when the AI needs to access a vast database of external documents (PDFs, reports) that don't fit in the prompt. While not used in our current "Forecaster" (which uses live API news), these folders exist for future expansion if we want to digest annual reports.
+
+* **fingpt/FinGPT_Sentiment_Analysis (v1 & v3)**
+   - **Significance**: specialized models for scoring financial text as Positive/Negative/Neutral.
+   - **Reason/Need**: Financial prediction often starts with sentiment. These folders contain code to train/run smaller, faster models specialized just for this one task, which can feed into larger forecasters.
+
+* **fingpt/FinGPT_Benchmark**
+   - **Significance**: Evaluation frameworks.
+   - **Reason/Need**: To scientifically prove an AI model works, it must be tested against standard datasets. This folder contains the code to run those tests.
+
+* **fingpt/FinGPT_FinancialReportAnalysis**
+   - **Significance**: Analyzes structured financial statements (Balance Sheets, P&L).
+   - **Reason/Need**: Complements news analysis by looking at the hard numbers.
+
+OUTSIDE the `fingpt/` package (in the root directory):
+
+* **offload/**
+   - **Significance**: Temporary storage for the Local Llama-2 Model layers.
+   - **Reason/Need**: When running the 7B model locally on a consumer PC, the model is often too big for the GPU's VRAM. The `accelerate` library "offloads" parts of the model to the CPU RAM or Hard Drive (into this folder) to prevent "Out of Memory" crashes. This is critical for the "Local Mode" of our project.
+
+* **figs/**
+   - **Significance**: Storage for images and diagrams.
+   - **Reason/Need**: Used by the `README.md` to display architecture diagrams and logos.
+
+* **.github/**
+   - **Significance**: Configuration for GitHub repository features.
+   - **Reason/Need**:
+     - `ISSUE_TEMPLATE`: Pre-defined forms (bug reports, feature requests) to help users file clear issues.
+     - `FUNDING.yml`: Adds a "Sponsor" button to the repo so users can support the developers.
+     - (Commonly also contains `workflows` for CI/CD automation, though not present here).
+
+4. STEP-BY-STEP CREATION PROCESS
+--------------------------------
+The project was built through an iterative process, moving from a basic research implementation
+ to a high-performance application.
+
+Phase 1: Environment & Dependency Setup
+   - We started by verifying the Python environment.
+   - We installed necessary libraries (`torch`, `transformers`, `peft`, `gradio`, `yfinance`, 
+   `finnhub-python`).
+
+Phase 2: Data Layer Implementation
+   - We integrated **YFinance** to fetch historical stock prices (Open, Close, High, Low).
+   - We integrated **Finnhub** to fetch company profile data and sentiment-rich market news.
+   - We wrote helper functions ("n_weeks_before", "get_stock_data") to process this raw data into 
+   a structured format for the AI.
+
+Phase 3: Initial Local Model (The Challenge)
+   - Initially, we set up the application to run the **Llama-2-7b-chat** model locally using 
+   Hugging Face's `transformers` and `peft` for LoRA adapters.
+   - **Issue**: Running a 7-billion parameter model locally on standard hardware is extremely 
+   slow (high latency) and resource-intensive.
+
+Phase 4: Optimization ( The Pivot to Cloud)
+   - To solve the performance bottleneck, we integrated the **Groq API**.
+   - We modified `app.py` to check for a `GROQ_API_KEY`.
+   - If found, the app bypasses the slow local model and sends the prompt to Groq's cloud 
+   inference engine.
+   - This reduced response time from minutes to seconds.
+
+Phase 5: User Experience & Stability
+   - We created `run_local.py` to handle the complexity of checking API keys, making it "one-click" 
+   for the user.
+   - We created `diagnose_env.py` to quickly identify missing keys or broken installs.
+   - We implemented a **Gradio** interface for a clean, web-based UI.
+
+5. APIs AND MODELS UTILISED
+---------------------------
+
+A. Groq API (Inference Engine)
+   - **Model Used**: `llama-3.3-70b-versatile`
+   - **Why we used it**:
+     - **Speed**: Groq uses Language Processing Units (LPUs) which are significantly faster than 
+     traditional GPUs for token generation. This provides a "real-time" feeling.
+     - **Performance**: The 70B model is far more capable and "smarter" than the local 7B model we
+      started with, providing better financial reasoning.
+     - **Context Window**: It handles larger prompts (more news articles and financial data) without
+      crashing.
+   - **Why not others?**: Local execution was too slow. OpenAI (GPT-4) is expensive and often slower. Groq offered the best balance of speed and open-source model performance.
+
+B. Finnhub API (Data Provider)
+   - **Why we used it**:
+     - It provides specialized financial data: **Company Profile**, **Basic Financials**, and 
+     **Market News**.
+     - It has a generous free tier suitable for development.
+     - It returns structured JSON data which is easy to parse.
+
+C. YFinance (Data Provider)
+   - **Why we used it**:
+     - It is the standard open-source library for fetching historical price data from Yahoo Finance.
+     - It is free and requires no API key for basic price history.
+
+D. Hugging Face / Llama-2 (Local Fallback)
+   - **Model Used**: `meta-llama/Llama-2-7b-chat-hf` with `FinGPT/fingpt-forecaster_dow30_llama2-7b_lora`
+   adapter.
+   - **Why we used it**:
+     - This was the original implementation of FinGPT. It serves as a fallback if the user has no 
+     internet or cloud API key.
+     - It demonstrates the capability of Fine-Tuning (LoRA) specifically for financial tasks.
+
+-------------------------------------------------------------------------
+Summary: We built a hybrid application that prefers high-speed Cloud APIs (Groq) for performance 
+but retains the ability to run locally (Hugging Face) for privacy/offline usage, supported by robust
+ financial data providers (YFinance, Finnhub).
