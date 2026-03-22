@@ -4,19 +4,22 @@ import time
 import json
 import random
 import finnhub
-import torch
-import gradio as gr
 import pandas as pd
 import yfinance as yf
-from pynvml import *
-from peft import PeftModel
+import gradio as gr
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from peft import PeftModel
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from huggingface_hub import login
 from dotenv import load_dotenv
 import groq
+from utils_vis import create_chart
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from fyers_data import analyze_stock as get_fyers_data
+except ImportError:
+    get_fyers_data = None
+
 
 load_dotenv()
 
@@ -32,6 +35,12 @@ if groq_api_key:
     tokenizer = None
 else:
     print(f"DEBUG: No GROQ_API_KEY. initializing Local Model (Slow)...")
+    import torch
+    from pynvml import *
+    from peft import PeftModel
+    from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+    from huggingface_hub import login
+
     if access_token:
         print(f"DEBUG: Token loaded from env: {access_token[:5]}...{access_token[-5:]} (Length: {len(access_token)})")
         try:
@@ -93,12 +102,29 @@ def n_weeks_before(date_string, n):
 
 def get_stock_data(stock_symbol, steps):
 
-    stock_data = yf.download(stock_symbol, steps[0], steps[-1])
+    try:
+        stock_data = yf.download(stock_symbol, steps[0], steps[-1])
+    except Exception as e:
+        print(f"Warning: yfinance download failed for {stock_symbol}: {e}")
+        stock_data = pd.DataFrame()
+
     if len(stock_data) == 0:
-        raise gr.Error(f"Failed to download stock price data for symbol {stock_symbol} from yfinance!")
+        print(f"Warning: Failed to download stock price data for symbol {stock_symbol} from yfinance. Continuing with empty historical data.")
+        # Return empty df with expected columns instead of crashing
+        return pd.DataFrame({
+            "Start Date": [datetime.strptime(d, "%Y-%m-%d") for d in steps[:-1]], 
+            "End Date": [datetime.strptime(d, "%Y-%m-%d") for d in steps[1:]],
+            "Start Price": [0] * (len(steps)-1), "End Price": [0] * (len(steps)-1)
+        })
     
     # Handle MultiIndex columns (yfinance v0.2+)
-    close_prices = stock_data['Close']
+    if 'Close' in stock_data.columns:
+        close_prices = stock_data['Close']
+    elif 'Adj Close' in stock_data.columns:
+        close_prices = stock_data['Adj Close']
+    else:
+        close_prices = stock_data.iloc[:, 0]
+
     if hasattr(close_prices, 'columns'): # Check if DataFrame
         close_prices = close_prices.iloc[:, 0] # Take first column (ticker)
 
@@ -121,6 +147,32 @@ def get_stock_data(stock_symbol, steps):
     })
 
 
+def get_daily_stock_data(symbol, start_date, end_date):
+    """
+    Fetches daily stock data for plotting.
+    """
+    try:
+        df = yf.download(symbol, start=start_date, end=end_date, progress=False)
+        if len(df) == 0:
+             return pd.DataFrame()
+        # Handle MultiIndex if present (yfinance v0.2+)
+        if 'Close' in df.columns:
+            close = df['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            
+            # Create a clean DF for plotting
+            plot_df = pd.DataFrame({
+                'Date': df.index,
+                'Close': close.values
+            })
+            return plot_df
+    except Exception as e:
+        print(f"Error fetching daily data: {e}")
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
 def get_news(symbol, data):
     
     news_list = []
@@ -130,9 +182,25 @@ def get_news(symbol, data):
         end_date = row['End Date'].strftime('%Y-%m-%d')
 #         print(symbol, ': ', start_date, ' - ', end_date)
         time.sleep(1) # control qpm
-        weekly_news = finnhub_client.company_news(symbol, _from=start_date, to=end_date)
+        
+        # Retry logic for flaky connections
+        max_retries = 3
+        weekly_news = []
+        for attempt in range(max_retries):
+            try:
+                weekly_news = finnhub_client.company_news(symbol, _from=start_date, to=end_date)
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to fetch news after {max_retries} attempts: {e}")
+                    # fail silently to allow the app to continue
+                    pass
+                print(f"Retrying news fetch... ({attempt + 1}/{max_retries})")
+                time.sleep(2)
+                
         if len(weekly_news) == 0:
-            raise gr.Error(f"No company news found for symbol {symbol} from finnhub!")
+            print(f"No company news found for symbol {symbol} from finnhub!")
+            # raise gr.Error(f"No company news found for symbol {symbol} from finnhub!")
         weekly_news = [
             {
                 "date": datetime.fromtimestamp(n['datetime']).strftime('%Y%m%d%H%M%S'),
@@ -150,9 +218,15 @@ def get_news(symbol, data):
 
 def get_company_prompt(symbol):
 
-    profile = finnhub_client.company_profile2(symbol=symbol)
+    try:
+        profile = finnhub_client.company_profile2(symbol=symbol)
+    except Exception as e:
+        print(f"Warning: Failed to fetch company profile from Finnhub: {e}")
+        profile = None
+
     if not profile:
-        raise gr.Error(f"Failed to find company profile for symbol {symbol} from finnhub!")
+        print(f"Warning: No company profile found for {symbol}.")
+        return f"[Company Introduction]:\n\nNo detailed company profile is available for {symbol}."
         
     company_template = "[Company Introduction]:\n\n{name} is a leading entity in the {finnhubIndustry} sector. Incorporated and publicly traded since {ipo}, the company has established its reputation as one of the key players in the market. As of today, {name} has a market capitalization of {marketCapitalization:.2f} in {currency}, with {shareOutstanding:.2f} shares outstanding." \
         "\n\n{name} operates primarily in the {country}, trading under the ticker {ticker} on the {exchange}. As a dominant force in the {finnhubIndustry} space, the company continues to innovate and drive progress within the industry."
@@ -215,7 +289,7 @@ def get_current_basics(symbol, curday):
     return basic
     
 
-def get_all_prompts_online(symbol, data, curday, with_basics=True):
+def get_all_prompts_online(symbol, data, curday, with_basics=True, use_fyers=True):
 
     company_prompt = get_company_prompt(symbol)
 
@@ -246,14 +320,25 @@ def get_all_prompts_online(symbol, data, curday, with_basics=True):
     else:
         basics = "[Basic Financials]:\n\nNo basic financial reported."
 
-    info = company_prompt + '\n' + prompt + '\n' + basics
-    prompt = info + f"\n\nBased on all the information before {curday}, let's first analyze the positive developments and potential concerns for {symbol}. Come up with 2-4 most important factors respectively and keep them concise. Most factors should be inferred from company related news. " \
-        f"Then make your prediction of the {symbol} stock price movement for next week ({period}). Provide a summary analysis to support your prediction."
+    # Try injecting Fyers intraday data
+    fyers_info = ""
+    if use_fyers and get_fyers_data:
+        print(f"DEBUG: Attempting to fetch Fyers intraday data for {symbol}")
+        fyers_result = get_fyers_data(symbol)
+        if fyers_result:
+             fyers_info = f"\n\n{fyers_result}\n"
+             print(f"DEBUG: Successfully fetched Fyers data: {fyers_result.split()[0]}...")
+        else:
+             print(f"DEBUG: No Fyers data available for {symbol}")
+
+    info = company_prompt + '\n' + prompt + '\n' + basics + fyers_info
+    prompt = info + f"\n\nBased on all the information before {curday}, including the historical macro news, financials, and the latest Fyers intraday market data (if available), let's first analyze the positive developments and potential concerns for {symbol}. Come up with 2-4 most important factors respectively and keep them concise. " \
+        f"Then make your prediction of the {symbol} stock price movement for next week ({period}), explicitly combining the macro historical trends and the micro intraday sentiment. Provide a summary analysis to support your prediction."
         
     return info, prompt
 
 
-def construct_prompt(ticker, curday, n_weeks, use_basics, api_mode=False):
+def construct_prompt(ticker, curday, n_weeks, use_basics, use_fyers, api_mode=False):
 
     try:
         steps = [n_weeks_before(curday, n) for n in range(n_weeks + 1)][::-1]
@@ -265,7 +350,7 @@ def construct_prompt(ticker, curday, n_weeks, use_basics, api_mode=False):
     data['Basics'] = [json.dumps({})] * len(data)
     # print(data)
     
-    info, prompt = get_all_prompts_online(ticker, data, curday, use_basics)
+    info, prompt = get_all_prompts_online(ticker, data, curday, use_basics, use_fyers)
     
     if not api_mode:
         prompt = B_INST + B_SYS + SYSTEM_PROMPT + E_SYS + prompt + E_INST
@@ -273,12 +358,12 @@ def construct_prompt(ticker, curday, n_weeks, use_basics, api_mode=False):
     return info, prompt
 
 
-def predict(ticker, date, n_weeks, use_basics):
+def predict(ticker, date, n_weeks, use_basics, use_fyers):
     print(f"DEBUG: Predict called for {ticker}")
     try:
         if groq_api_key:
             print("Using Groq API for inference...")
-            info, prompt_content = construct_prompt(ticker, date, n_weeks, use_basics, api_mode=True)
+            info, prompt_content = construct_prompt(ticker, date, n_weeks, use_basics, use_fyers, api_mode=True)
             
             # Using llama-3.3-70b-versatile as the previous model was decommissioned
             chat_completion = client.chat.completions.create(
@@ -295,11 +380,18 @@ def predict(ticker, date, n_weeks, use_basics):
                 model="llama-3.3-70b-versatile",
             )
             answer = chat_completion.choices[0].message.content
-            return info, answer
+            
+            # Generate Chart
+            start_date = n_weeks_before(date, n_weeks)
+            plot_data = get_daily_stock_data(ticker, start_date, date)
+            fig = create_chart(ticker, plot_data, answer)
+            
+            return info, answer, fig
+
         
         print_gpu_utilization()
 
-        info, prompt = construct_prompt(ticker, date, n_weeks, use_basics)
+        info, prompt = construct_prompt(ticker, date, n_weeks, use_basics, use_fyers)
           
         inputs = tokenizer(
             prompt, return_tensors='pt', padding=False
@@ -318,11 +410,19 @@ def predict(ticker, date, n_weeks, use_basics):
 
         torch.cuda.empty_cache()
         
-        return info, answer
+        torch.cuda.empty_cache()
+        
+        # Generate Chart
+        start_date = n_weeks_before(date, n_weeks)
+        plot_data = get_daily_stock_data(ticker, start_date, date)
+        fig = create_chart(ticker, plot_data, answer)
+        
+        return info, answer, fig
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return "Error", f"An error occurred: {e}"
+        return "Error", f"An error occurred: {e}", None
 
 
 demo = gr.Interface(
@@ -350,24 +450,31 @@ demo = gr.Interface(
             label="Use Latest Basic Financials",
             value=False,
             info="If checked, the latest quarterly reported basic financials of the company is taken into account."
+        ),
+        gr.Checkbox(
+            label="Use Fyers Intraday Data (10m)",
+            value=True,
+            info="If checked, the latest 10-minute candle data from Fyers will be used to analyze intraday trends and provide more accurate predictions."
         )
     ],
     outputs=[
         gr.Textbox(
-            label="Information",
+            label="Information (Including Fyers Intraday Trends)",
             lines=14
         ),
         gr.Textbox(
             label="Response",
             lines=14
-        )
+        ),
+        gr.Plot(label="Price Prediction Chart")
     ],
-    title="FinGPT-Forecaster",
+
+    title="FinGPT-Forecaster (Pro with Intraday Fyers)",
     description="""FinGPT-Forecaster takes random market news and optional basic financials related to the specified company from the past few weeks as input and responds with the company's **positive developments** and **potential concerns**. Then it gives out a **prediction** of stock price movement for the coming week and its **analysis** summary.
 This model is finetuned on Llama2-7b-chat-hf with LoRA on the past year's DOW30 market data. Inference in this demo uses fp16 and **welcomes any ticker symbol**.
-Company profile & Market news & Basic financials & Stock prices are retrieved using **yfinance & finnhub**.
+Company profile & Market news & Basic financials & Stock prices are retrieved using **yfinance & finnhub**. Recent intraday data is powered by **Fyers API**.
 This is just a demo showing what this model is capable of. Results inferred from randomly chosen news can be strongly biased.
-This is our AD Lab project based onn the material provided by our faculty via https://github.com/AI4Finance-Foundation/FinGPT . Developed by Piyush and Pranjal.
+This is our AD Lab project based on the material provided by our faculty via https://github.com/AI4Finance-Foundation/FinGPT . Developed by Piyush and Pranjal.
 **Disclaimer: Nothing herein is financial advice, and NOT a recommendation to trade real money. Please use common sense and always first consult a professional before trading or investing.**
 """
 )
